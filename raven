@@ -1,0 +1,787 @@
+#!/bin/bash
+
+# Raven is a simple package manager for GNU/Linux
+# Author: Pablo Gonzalez <hello@jezrael.com>
+# License: GPLv2
+
+RAVEN_NAME="raven"
+RAVEN_VERSION="1.0"
+RAVEN_CONF="/etc/raven.conf"
+
+# Check if exists the configuration file.
+if [ ! -f $RAVEN_CONF ]; then
+  echo -e "ERROR: Cannot get the configuration file for $RAVEN_NAME"
+  echo -e $RAVEN_CONF
+  exit 1
+fi
+
+# Load the configuration file.
+source $RAVEN_CONF
+
+# Check if running as root.
+check_user()
+{
+  if [ $UID -ne 0 ]; then
+    echo -e "ERROR: You cannot perform this operation unless you are root."
+    exit 1
+  fi
+}
+
+# This function make a lock.
+lock()
+{
+  touch $LOCK_FILE
+}
+
+# This function check if exists the lock.
+is_locked()
+{
+  [ -f $LOCK_FILE ]
+}
+
+# This function remove the lock.
+unlock()
+{
+  if [ -f $LOCK_FILE ]; then
+    rm $LOCK_FILE
+  fi
+}
+
+# Check if exists a function.
+# $1 - function
+function_exists()
+{
+  [[ $(type -t $1 2>/dev/null) == 'function' ]]
+}
+
+# Check if an item exists in list.
+# $1 - ${list[@]}
+# $2 - item
+contains()
+{
+  LIST=("$@")
+  SIZE=${#LIST[@]}
+  SIZE=$((SIZE-1))
+  LAST=${LIST[SIZE]}
+  unset LIST[SIZE]
+
+  for ELEMENT in ${LIST[@]}; do
+    if [ "$ELEMENT" = "$LAST" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Show the confirmation message.
+confirmation()
+{
+  read -p "Do you want continue? [Y/n] " -r
+  echo ""
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "ERROR: Operation aborted"
+    exit 1
+  fi
+}
+
+pause_key()
+{
+  read -n 1 -s -p "$1"
+}
+
+# This function make a tree of the file system.
+tree_root()
+{
+  shopt -s nullglob
+  shopt -s dotglob
+  find / -type f -not \( -wholename "/mnt/*" -or -wholename \
+  "/home/*" -or -wholename "/sys/*" -or -wholename "/proc/*" -or -wholename \
+  "/dev/*" -or -wholename "/media/*" -or -wholename "/tmp/*" -or -wholename \
+  "/run/*" -or -wholename "/root/*" -or -wholename "/tools/*" -or -wholename \
+  "/source/*" \)
+}
+
+# Conditional operator (equals than).
+version_eq()
+{
+  [ "$1" = "$2" ]
+}
+
+# Conditional operator (greeter than).
+version_gt()
+{
+  R=$(echo -e "$1\n$2" | sort -V | head -n1)
+  [ "$1" = "$2" ] && return 1 || [ "$2" = "$R" ]
+}
+
+# Conditional operator (less than).
+version_lt()
+{
+  R=$(echo -e "$1\n$2" | sort -rV | head -n1)
+  [ "$1" = "$2" ] && return 1 || [ "$2" = "$R" ]
+}
+
+# Conditional operator (less or equals than).
+version_le()
+{
+  [ "$1" = "$2" ] || version_lt "$1" "$2"
+}
+
+# Conditional operator (greeter or equals than).
+version_ge()
+{
+  [ "$1" = "$2" ] || version_gt "$1" "$2"
+}
+
+
+UD_conflicts()
+{
+  PKG=$1
+  IFS='-' read -ra ARRAY <<< "$PKG"
+  PKGNAME=${ARRAY[0]}
+  PKGVERSION=${ARRAY[1]}
+  DEPS_CONFLICTS=""
+  LISTDIR=$(ls -l $PACKAGES_DIR/*.meta 2> /dev/null | awk {'print $9'})
+
+  for META in ${LISTDIR[@]}; do
+    unset NAME
+    unset VERSION
+    unset DEPENDS
+    source $META
+    for DEPENDENCY in ${DEPENDS[@]}; do
+      DOPERATOR=''
+      if [[ $DEPENDENCY =~ ^.*?\=.*?$ ]]; then
+        DOPERATOR='version_eq'
+      elif [[ $DEPENDENCY =~ ^.*?\>.*?$ ]]; then
+        DOPERATOR='version_gt'
+      elif [[ $DEPENDENCY =~ ^.*?\>\=.*?$ ]]; then
+        DOPERATOR='version_ge'
+      elif [[ $DEPENDENCY =~ ^.*?\<.*?$ ]]; then
+        DOPERATOR='version_lt'
+      elif [[ $DEPENDENCY =~ ^.*?\<\=.*?$ ]]; then
+        DOPERATOR='version_le'
+      fi
+
+      AUX=''
+      if [[ "$DOPERATOR" = "version_eq" ]]; then
+        AUX='='
+      elif [[ "$DOPERATOR" = "version_gt" ]]; then
+        AUX='>'
+      elif [[ "$DOPERATOR" = "version_ge" ]]; then
+        AUX='>='
+      elif [[ "$DOPERATOR" = "version_lt" ]]; then
+        AUX='<'
+      elif [[ "$DOPERATOR" = "version_le" ]]; then
+        AUX='<='
+      fi
+
+      IFS="$AUX" read -ra AD <<< "$DEPENDENCY"
+      DNAME=${AD[0]}
+      DVERSION=${AD[1]}
+
+      if [ $PKGNAME = $DNAME ]; then
+        OPERATION='"$DOPERATOR" "$DVERSION" "$PKGVERSION"'
+        if ! eval "$OPERATION"; then
+          DEPS_CONFLICTS+=$DEPS_CONFLICTS$NAME-$VERSION";"
+        fi
+      fi
+    done
+  done
+
+  echo $DEPS_CONFLICTS
+}
+
+# Show all installed packages.
+pkglist()
+{
+  LISTDIR=$(ls -l $PACKAGES_DIR/*.meta 2> /dev/null | awk {'print $9'})
+
+  if [[ $LISTDIR = "" ]]; then
+    echo -e "ERROR: Cannot find packages on $PACKAGES_DIR"
+    exit 1
+  fi
+
+  N=0
+  for X in ${LISTDIR[@]}; do
+    N=$((N=N+1))
+  done
+  echo -e "Installed packages: $N"
+
+  for META in ${LISTDIR[@]}; do
+    NAME=$(echo $META | sed 's#'$PACKAGES_DIR'/\(.*\)\.meta#\1#')
+    echo -e $NAME
+  done
+}
+
+# Show the information of a package.
+# $1 - name-version
+pkginfo()
+{
+  PKG=$1
+  if [ ! -f $PACKAGES_DIR/$PKG.meta ]; then
+    echo -e "E: Target not found: $PKG"
+    exit 1
+  fi
+  source $PACKAGES_DIR/$PKG.meta
+  echo -e "Package: $NAME-$VERSION"
+  if [[ $DEPENDS != '' ]]; then
+    STR="Dependencies: "
+    for D in ${DEPENDS[@]}; do
+        STR=$STR"$D "
+    done
+    echo -e $STR
+  fi
+
+  if [[ $LICENSE != "" ]]; then
+    echo -e "License: $LICENSE"
+  fi
+
+  echo -e "Installation date: $DATE"
+}
+
+# Uninstall a package.
+# $1 - name-version
+pkgremove()
+{
+  PKG=$1
+  if [ ! -f $PACKAGES_DIR/$PKG.meta ]; then
+    echo -e "E: Target not found: $PKG"
+    exit 1
+  fi
+
+  DEPS_FAILED=()
+  LISTDIR=$(ls -l $PACKAGES_DIR/*.meta 2> /dev/null | awk {'print $9'})
+
+  for META in ${LISTDIR[@]}; do
+    unset NAME
+    unset VERSION
+    unset DEPENDS
+    source $META
+    for DEPENDENCY in ${DEPENDS[@]}; do
+      DEPENDENCY=$(echo $DEPENDENCY | sed "s/=/-/g")
+      if [ $DEPENDENCY = $PKG ]; then
+        DEPS_FAILED+=("$NAME-$VERSION")
+      fi
+    done
+  done
+
+  if [ ${#DEPS_FAILED[@]} -gt 0 ]; then
+    echo -e "ERROR: The following packages are dependencies of $PKG"
+    for D in ${DEPS_FAILED[@]}; do
+      echo -e $D
+    done
+    exit 1
+  fi
+
+  source $PACKAGES_DIR/$PKG.meta
+
+  echo -e "The next package $NAME-$VERSION it will uninstall"
+  confirmation
+
+  F=0
+
+  ROOT=/
+  while IFS='' read -r line || [[ -n "$line" ]]; do
+    if ! rm $ROOT/$line 2> /dev/null; then
+      F=$((F=F+1))
+    fi
+  done < "$PACKAGES_DIR/$PKG.tree"
+
+  if ! rm $PACKAGES_DIR/$PKG.meta; then
+    F=$((F=F+1))
+  fi
+
+  if ! rm $PACKAGES_DIR/$PKG.tree; then
+    F=$((F=F+1))
+  fi
+
+  if [ $F -eq 0 ]; then
+    echo -e "The package was uninstall $PKG successfull"
+  else
+    echo -e "ERROR: Some files from $PKG was not been removed"
+  fi
+
+}
+
+pkginstall()
+{
+  PKG=$1
+  UPGRADE=no
+  DOWNGRADE=no
+
+  if [ ! -f $PKG ]; then
+    echo -e "ERROR: Cannot get the file $PKG"
+    exit 1
+  fi
+
+  source $PKG
+
+  if [ -z $NAME ]; then
+    echo -e "ERROR: Cannot get the name of the package"
+    exit 1
+  elif [ -z $VERSION ]; then
+    echo -e "ERROR: Cannot get the version of the package"
+    exit 1
+  elif [ -z $FILES ]; then
+    echo -e "ERROR: Cannot get source code files"
+    exit 1
+  elif [ -z $MD5SUMS ]; then
+    echo -e "ERROR: Cannot get the MD5 checksums of the package"
+    exit 1
+  elif [ -z $DEPENDS ]; then
+    if [ ${#DEPENDS[@]} -eq 0 ]; then
+      echo "ERROR: Cannot get the dependencies of the package"
+      exit 1
+    fi
+  elif ! function_exists PREPARE; then
+    echo -e "ERROR: Cannot get the 'PREPARE' step of the package"
+    exit 1
+  elif ! function_exists BUILD; then
+    echo -e "ERROR: Cannot get the 'BUILD' step of the package"
+    exit 1
+  elif ! function_exists CHECK; then
+    echo -e "ERROR: Cannot get the 'CHECK' step of the package"
+    exit 1
+  elif ! function_exists MERGE; then
+    echo -e "ERROR: Cannot get the 'MERGE' step of the package"
+    exit 1
+  fi
+
+  if [ $(ls $PACKAGES_DIR/$NAME-*.meta 2> /dev/null) ]; then
+
+    V=$VERSION
+    N=$NAME
+    unset NAME
+    unset VERSION
+    unset DEPENDS
+
+    source $(ls $PACKAGES_DIR/$N-*.meta)
+    IV=$VERSION
+
+    if [ $VERSION = $V ]; then
+      if [ $REINSTALL = 'yes' ]; then
+        echo -e "The package $NAME-$VERSION it will reinstall"
+        confirmation
+      else
+        echo -e "ERROR: The package $NAME-$VERSION was been installed"
+        exit 1
+      fi
+    fi
+
+    if version_gt $V $VERSION; then
+      echo -e "The version of the package is greeter than installed"
+      echo -e "Package installed: $NAME-$VERSION"
+      echo -e "Package to install: $NAME-$V"
+      confirmation
+
+      STR=$(UD_conflicts "$NAME-$V")
+      IFS=';' read -ra CONFLICTS <<< "$STR"
+
+      N=${#CONFLICTS[@]}
+
+      if [ $N -gt 0 ]; then
+        echo -e "ERROR: The package was not upgrade because the following packages"
+        echo -e "depends of $NAME-$VERSION"
+
+        for CONFLICT in $CONFLICTS; do
+          echo -e $CONFLICT
+          exit 1
+        done
+      fi
+      UPGRADE=yes
+    fi
+
+    if version_lt $V $VERSION; then
+      echo -e "The version of the package is less than installed"
+      echo -e "Package installed: $NAME-$VERSION"
+      echo -e "Package to install: $NAME-$V"
+      confirmation
+
+      STR=$(UD_conflicts "$NAME-$V")
+      IFS=';' read -ra CONFLICTS <<< "$STR"
+
+      N=${#CONFLICTS[@]}
+
+      if [ $N -gt 0 ]; then
+        echo -e "ERROR: The package was not downgrade because the following packages"
+        echo -e "depends of $NAME-$VERSION"
+
+        for CONFLICT in $CONFLICTS; do
+          echo -e $CONFLICT
+          exit 1
+        done
+      fi
+
+      DOWNGRADE=yes
+    fi
+
+  else
+    echo -e "The package $NAME-$VERSION it will install"
+    confirmation
+  fi
+
+  source $PKG
+
+  echo -e "Checking dependencies..."
+
+  # Check if dependencies was installed.
+  DEPS_FAILED=()
+  for DEPENDENCY in ${DEPENDS[@]}; do
+
+    if [[ $DEPENDENCY =~ ^.*?\=.*?$ ]]; then
+      C="="
+    elif [[ $DEPENDENCY =~ ^.*?\<.*?$ ]]; then
+      C="<"
+    elif [[ $DEPENDENCY =~ ^.*?\<\=.*?$ ]]; then
+      C="<="
+    elif [[ $DEPENDENCY =~ ^.*?\>.*?$ ]]; then
+      C=">"
+    elif [[ $DEPENDENCY =~ ^.*?\>\=.*?$ ]]; then
+      C=">="
+    else
+      echo -e "ERROR: There are a problem with declaration of the dependencies"
+      exit 1
+    fi
+
+    IFS="$C" read -ra ARRAY <<< "$DEPENDENCY"
+    A=${ARRAY[0]} # name
+    B=${ARRAY[1]} # version
+    D=$(ls $PACKAGES_DIR/$A-*.meta 2> /dev/null)
+
+    if [ "$D" = "" ]; then
+      DEPS_FAILED+=($DEPENDENCY)
+      continue
+    fi
+
+    E=$(echo $D | sed 's#'$PACKAGES_DIR'/\(.*\)\.meta#\1#')
+    F=${E#*-}
+
+    if [ "$C" = "=" ] && [ "$F" = "$B" ]; then
+      continue
+    elif [ "$C" = ">" ] && version_gt $F $B; then
+      continue
+    elif [ "$C" = ">=" ] && version_ge $F $B; then
+      continue
+    elif [ "$C" = "<" ] && version_lt $F $B; then
+      continue
+    elif [ "$C" = "<=" ] && version_le $F $B; then
+      continue
+    else
+      DEPS_FAILED+=($DEPENDENCY)
+    fi
+  done
+
+  if [ ${#DEPS_FAILED[@]} -gt 0 ]; then
+    echo -e "ERROR: The following dependencies are needed to install the package:"
+    for DF in ${DEPS_FAILED[@]}; do
+      echo -e $DF
+    done
+    exit 1
+  fi
+
+  SRCDIR="$BUILD_DIR/$NAME-$VERSION"
+
+  if [ -d $SRCDIR ]; then
+    rm -rf $SRCDIR
+  fi
+
+  CDIR=$(pwd)
+  mkdir $SRCDIR
+  cd $SRCDIR
+
+  X=${#FILES[@]}
+  Y=${#MD5SUMS[@]}
+
+  if [[ $X != $Y ]]; then
+    echo -e "ERROR: There are a problem with MD5 checksum"
+    exit 1
+  fi
+
+  X=0
+  for FILE in ${FILES[@]}; do
+
+    if [ ! -f "$CDIR/$FILE" ]; then
+      echo -e "E: Cannot find the file $CDIR/$FILE"
+      exit 1
+    fi
+
+    cp $CDIR/$FILE $SRCDIR
+
+    MD5=$(md5sum $FILE | awk '{ print $1 }')
+    SHA=${MD5,,}
+    if [[ $SHA = 'skip' ]]; then
+      X=$((X=X+1))
+      continue
+    else
+      if [[ $SHA != ${MD5SUMS[$X]} ]]; then
+        echo -e "ERROR: Wrong MD5 checksum for the $FILE"
+        exit 1
+      fi
+    fi
+    X=$((X=X+1))
+  done
+
+  SD=$SRCDIR
+  NV=$NAME-$VERSION
+
+  echo -e "Running BEFORE action..."
+  tree_root > $SRCDIR/.BEFORE 2> /dev/null
+
+  echo -e "Configuring $NAME-$VERSION..."
+
+  [[ $QUIET = 'yes' ]] && ! PREPARE > /dev/null 2>&1 && F='yes'
+  [[ $QUIET = 'no' ]] && ! PREPARE && F='yes'
+
+  if [[ $F = 'yes' ]] && [[ $IGNORE = 'no' ]]; then
+    echo -e "ERROR: The configuration has been failed to $NAME-$VERSION"
+    confirmation
+  else
+    [[ $QUIET = 'no' ]] && pause_key \
+    "The configuration has been finished press any key to continue..."
+    echo -e ''
+  fi
+
+  echo -e "Compiling $NAME-$VERSION..."
+
+  [[ $QUIET = 'yes' ]] && ! BUILD > /dev/null 2>&1 && F='yes'
+  [[ $QUIET = 'no' ]] && ! BUILD && F='yes'
+
+  if [[ $F = 'yes' ]] && [ $IGNORE = 'no' ]; then
+    echo -e "ERROR: The compilation has been failed to $NAME-$VERSION"
+    confirmation
+  else
+    [[ $QUIET = 'no' ]] && pause_key \
+      "The compilation has been finished press any key to continue..."
+    echo -e ''
+  fi
+
+  if [ $CHECK = 'yes' ]; then
+    echo -e "Running tests..."
+
+    [[ $QUIET = 'yes' ]] && ! CHECK > /dev/null 2>&1 && F='yes'
+    [[ $QUIET = 'no' ]] && ! CHECK && F='yes'
+
+    if [[ $F = 'yes' ]] && [[ $IGNORE = 'no' ]]; then
+      echo -e "ERROR: The tests has been failed to $NAME-$VERSION"
+      confirmation
+    else
+      [[ $QUIET = 'no' ]] && pause_key \
+      "The tests has been finished press any key to continue..."
+      echo -e ''
+    fi
+  fi
+
+  echo -e "Installing $NAME-$VERSION..."
+  D=$(date +%m/%d/%Y-%H:%M:%S)
+
+  [[ $QUIET = 'yes' ]] && ! MERGE > /dev/null 2>&1 && F='yes'
+  [[ $QUIET = 'no' ]] && ! MERGE && F='yes'
+
+  if [[ $F = 'yes' ]] && [[ $IGNORE = 'no' ]]; then
+    echo -e "ERROR: The installation has been failed to $NAME-$VERSION"
+    confirmation
+  fi
+
+  echo -e "Running AFTER action..."
+  tree_root > $SRCDIR/.AFTER 2> /dev/null
+
+  diff -u "$SRCDIR/.BEFORE" "$SRCDIR/.AFTER" | grep ^+/ | cut -c 2- > \
+  $SRCDIR/$NAME-$VERSION.tree
+
+  R=$(cat $SRCDIR/$NAME-$VERSION.tree)
+  if [[ $R = "" ]]; then
+
+    if [ $REINSTALL = 'yes' ]; then
+      echo -e "The package $NAME-$VERSION has been reinstalled successfull"
+      exit 1
+    fi
+    echo -e "ERROR: The package not contains files"
+    exit 1
+  fi
+
+  if [ $UPGRADE = 'yes' ]; then
+    diff -u $PACKAGES_DIR/$NAME-$IV.tree $SRCDIR/$NAME-$VERSION.tree \
+    | tail -n+4 | grep ^- | cut -c 2- > $SRCDIR/.TEMP
+
+    ROOT=/
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+      rm $ROOT/$line
+    done < "$SRCDIR/.TEMP"
+
+    rm $PACKAGES_DIR/$NAME-$IV.meta
+    rm $PACKAGES_DIR/$NAME-$IV.tree
+  fi
+
+  if [ $DOWNGRADE = 'yes' ]; then
+    diff -u $SRCDIR/$NAME-$V.tree $PACKAGES_DIR/$NAME-$IV.tree \
+    | tail -n+4 | grep ^+ | cut -c 2- > $SRCDIR/.TEMP
+
+    ROOT=/
+    while IFS='' read -r line || [[ -n "$line" ]]; do
+      rm $ROOT/$line
+    done < "$SRCDIR/.TEMP"
+
+    rm $PACKAGES_DIR/$NAME-$IV.meta
+    rm $PACKAGES_DIR/$NAME-$IV.tree
+  fi
+
+  echo '#!bin/bash' > $SRCDIR/$NAME-$VERSION.meta
+  echo "" >> $SRCDIR/$NAME-$VERSION.meta
+  echo "NAME='$NAME'" >> $SRCDIR/$NAME-$VERSION.meta
+  echo "VERSION=$VERSION" >> $SRCDIR/$NAME-$VERSION.meta
+  echo "LICENSE='$LICENSE'" >> $SRCDIR/$NAME-$VERSION.meta
+  echo "DATE='$D'" >> $SRCDIR/$NAME-$VERSION.meta
+
+  AUX=''
+  N=${#DEPENDS[@]}
+  for (( i = 0; i < $N; i++ )); do
+    if [[ $i = $(( $N - 1 )) ]]; then
+      AUX=$AUX"'${DEPENDS[i]}'"
+      continue
+    fi
+    AUX=$AUX"'${DEPENDS[i]}' "
+  done
+
+  AUX="DEPENDS=($AUX)"
+
+  echo $AUX >> $SRCDIR/$NAME-$VERSION.meta
+
+  mv $SRCDIR/$NAME-$VERSION.meta $PACKAGES_DIR/$NAME-$VERSION.meta
+  mv $SRCDIR/$NAME-$VERSION.tree $PACKAGES_DIR/$NAME-$VERSION.tree
+  rm $SRCDIR/.BEFORE
+  rm $SRCDIR/.AFTER
+
+  if [ "$CLEAN" = "yes" ]; then
+    echo -e "Cleaning..."
+    rm -rf $SRCDIR
+  fi
+
+  if [ "$UPGRADE" = "yes" ]; then
+    echo -e "$NAME has been upgraded successfull"
+  elif [ "$DOWNGRADE" = "yes" ]; then
+    echo -e "$NAME has been downgraded successfull"
+  else
+    echo -e "$NAME has been installed successfull"
+fi
+
+}
+
+# Show the help.
+show_help()
+{
+  echo -e "Usage: $RAVEN_NAME [options] command"
+  echo -e ""
+  echo -e "$RAVEN_NAME is a simple package manager for GNU/Linux"
+  echo -e ""
+  echo -e "Commands:"
+  echo -e "  -I | --install - install a package"
+  echo -e "  -R | --remove - remove a package"
+  echo -e "  -S | --show - show the package info"
+  echo -e "  -L | --list - list installed"
+  echo -e "  -H | --help - show help"
+  echo -e "  -V | --version - show $RAVEN_NAME version"
+  echo -e ""
+  echo -e "Options:"
+  echo -e "  -q | --quiet - no compile output"
+  echo -e "  -c | --check - run tests after build"
+  echo -e "  -n | --clean - clean after install"
+  echo -e "  -e | --reinstall - reinstall a package"
+}
+
+# Show the help.
+show_version()
+{
+  echo -e "$RAVEN_NAME-$RAVEN_VERSION"
+}
+
+# Remove the lock.
+trap unlock EXIT
+
+# Check if exists the lock.
+if is_locked; then
+  echo -e "ERROR: The package manager is locked"
+  exit 1
+else
+  lock
+fi
+
+ARGS=$(getopt -o "I:R:S:LHVqcneg" -l \
+"install:,remove:,show:,list,help,version,quiet,check,clean,reinstall,ignore" \
+-- "$@")
+
+if [ $? -ne 0 ]; then
+  show_help
+fi
+
+eval set -- "$ARGS"
+
+CLEAN=no
+QUIET=no
+REINSTALL=no
+CHECK=no
+IGNORE=no
+
+while true; do
+  case "$1" in
+    -I | --install)
+      shift;
+        if [ -n "$1" ]; then
+          check_user && pkginstall $1;
+          shift;
+        fi
+      ;;
+    -R | --remove)
+      shift;
+      if [ -n "$1" ]; then
+        check_user && pkgremove $1;
+        shift;
+      fi
+      ;;
+    -S | --show)
+      shift;
+      if [ -n "$1" ]; then
+        pkginfo $1;
+        shift;
+      fi
+      ;;
+    -L | --list)
+      shift;
+      pkglist;
+      ;;
+    -H | --help)
+      shift;
+      show_help;
+      ;;
+    -V | --version)
+      shift;
+      show_version;
+      ;;
+    -q | --quiet)
+      shift;
+      QUIET=yes;
+      ;;
+    -c | --check)
+      shift;
+      CHECK=yes;
+      ;;
+    -n | --clean)
+      shift;
+      CLEAN=yes;
+      ;;
+    -e | --reinstall)
+      shift;
+      REINSTALL=yes;
+      ;;
+    -g | --ignore)
+      shift;
+      IGNORE=yes;
+      ;;
+    --)
+    shift;
+    break;
+    ;;
+    *)
+    break;
+    ;;
+  esac
+done
